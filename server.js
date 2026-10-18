@@ -1,93 +1,75 @@
-const express = require('express');
-const path = require('path');
-const fs = require('fs');
-const crypto = require('crypto');
-
+// Duccy store backend. Env: ADMIN_PASSWORD, TOKEN_SECRET, SITE_URL (optional), DATA_FILE (optional)
+const express = require('express'), crypto = require('crypto'), fs = require('fs'), path = require('path');
 const app = express();
-const PORT = process.env.PORT || 3000;
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
-const TOKEN_SECRET = process.env.TOKEN_SECRET;
+app.set('trust proxy', 1);
+app.use(express.json({ limit: '50kb' }));
+
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD, TOKEN_SECRET = process.env.TOKEN_SECRET;
+if (!ADMIN_PASSWORD || !TOKEN_SECRET || TOKEN_SECRET.length < 16) { console.error('Set ADMIN_PASSWORD and TOKEN_SECRET (16+ chars) env vars'); process.exit(1); }
+const SITE_URL = (process.env.SITE_URL || '').replace(/\/$/, '');
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data', 'store.json');
-if (!ADMIN_PASSWORD || !TOKEN_SECRET) {
-  console.warn('WARNING: Set ADMIN_PASSWORD and TOKEN_SECRET environment variables before production use.');
-}
-app.use(express.json({limit:'100kb'}));
-app.use(express.static(path.join(__dirname,'public')));
+const FREE_ABOVE = 699, SHIP_FEE = 59, STATUSES = ['Pending', 'Confirmed', 'Packed', 'Shipped', 'Delivered', 'Cancelled'];
+const products = Object.fromEntries(JSON.parse(fs.readFileSync(path.join(__dirname, 'products.json'))).map(p => [p.id, p]));
 
-function ensureData(){
-  fs.mkdirSync(path.dirname(DATA_FILE),{recursive:true});
-  if(!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, JSON.stringify({orders:[]},null,2));
-}
-function readData(){ensureData();try{return JSON.parse(fs.readFileSync(DATA_FILE,'utf8'))}catch(e){return {orders:[]}}}
-function writeData(data){ensureData();fs.writeFileSync(DATA_FILE,JSON.stringify(data,null,2))}
-function signToken(payload){const body=Buffer.from(JSON.stringify(payload)).toString('base64url');const sig=crypto.createHmac('sha256',TOKEN_SECRET||'local-dev-only').update(body).digest('base64url');return body+'.'+sig}
-function auth(req,res,next){
-  const raw=(req.headers.authorization||'').replace(/^Bearer\s+/i,'');const parts=raw.split('.');
-  if(parts.length!==2)return res.status(401).json({error:'Admin sign-in required'});
-  const expected=crypto.createHmac('sha256',TOKEN_SECRET||'local-dev-only').update(parts[0]).digest('base64url');
-  if(!crypto.timingSafeEqual(Buffer.from(parts[1]),Buffer.from(expected)))return res.status(401).json({error:'Invalid admin session'});
-  let p;try{p=JSON.parse(Buffer.from(parts[0],'base64url').toString())}catch(e){return res.status(401).json({error:'Invalid admin session'})}
-  if(!p.exp||p.exp<Date.now())return res.status(401).json({error:'Admin session expired'});
+fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
+let db = { orders: [] };
+try { db = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); } catch (_) {}
+const save = () => { fs.writeFileSync(DATA_FILE + '.tmp', JSON.stringify(db)); fs.renameSync(DATA_FILE + '.tmp', DATA_FILE); };
+
+// simple rate limiter
+const hits = new Map();
+const limit = (name, max, ms) => (req, res, next) => {
+  const k = name + req.ip, now = Date.now(), arr = (hits.get(k) || []).filter(t => now - t < ms);
+  if (arr.length >= max) return res.status(429).json({ error: 'Too many attempts. Try again later.' });
+  arr.push(now); hits.set(k, arr); next();
+};
+const eq = (a, b) => { const x = crypto.createHash('sha256').update(String(a)).digest(), y = crypto.createHash('sha256').update(String(b)).digest(); return crypto.timingSafeEqual(x, y); };
+const sign = s => crypto.createHmac('sha256', TOKEN_SECRET).update(s).digest('hex');
+const makeToken = () => { const exp = Date.now() + 12 * 3600e3; return exp + '.' + sign('admin.' + exp); };
+const auth = (req, res, next) => {
+  const [exp, sig] = (req.headers.authorization || '').replace('Bearer ', '').split('.');
+  if (!exp || !sig || Date.now() > +exp || !eq(sig, sign('admin.' + exp))) return res.status(401).json({ error: 'Please sign in again' });
   next();
-}
-app.post('/api/admin/login',(req,res)=>{
-  if(!ADMIN_PASSWORD||!TOKEN_SECRET)return res.status(503).json({error:'Admin is not configured. Set ADMIN_PASSWORD and TOKEN_SECRET.'});
-  const password=String(req.body.password||'');
-  const a=Buffer.from(password),b=Buffer.from(ADMIN_PASSWORD);
-  if(a.length!==b.length||!crypto.timingSafeEqual(a,b))return res.status(401).json({error:'Incorrect password'});
-  res.json({token:signToken({exp:Date.now()+8*60*60*1000})});
-});
-app.post('/api/orders',(req,res)=>{
-  const body=req.body||{},c=body.customer||{},items=body.items;
-  if(!c.name||!/^([6-9]\d{9})$/.test(String(c.phone||''))||!c.address||!c.city||!/^(\d{6})$/.test(String(c.pin||'')))return res.status(400).json({error:'Please provide valid delivery details'});
-  if(!Array.isArray(items)||!items.length)return res.status(400).json({error:'Your cart is empty'});
-  if(!['COD','ONLINE_PAID'].includes(body.paymentMethod))return res.status(400).json({error:'Select a valid payment method'});
-  let total=0;
-  const cleanItems=[];
-  for(const i of items){
-    const price=Number(i.price),quantity=Number(i.quantity);
-    if(!i.name||!Number.isFinite(price)||price<0||!Number.isInteger(quantity)||quantity<1||quantity>20)return res.status(400).json({error:'Invalid cart item'});
-    total+=price*quantity;cleanItems.push({productId:Number(i.productId)||null,name:String(i.name).slice(0,120),price,quantity,size:String(i.size||'').slice(0,20),color:String(i.color||'').slice(0,30)});
+};
+const txt = (v, max) => String(v ?? '').trim().slice(0, max);
+
+app.post('/api/orders', limit('order', 10, 3600e3), (req, res) => {
+  const b = req.body || {}, c = b.customer || {};
+  const customer = { name: txt(c.name, 80), phone: txt(c.phone, 10), address: txt(c.address, 250), city: txt(c.city, 60), pin: txt(c.pin, 6) };
+  if (customer.name.length < 2 || !/^[6-9]\d{9}$/.test(customer.phone) || customer.address.length < 8 || !customer.city || !/^\d{6}$/.test(customer.pin))
+    return res.status(400).json({ error: 'Please check name, phone, address, city and PIN code' });
+  if (!Array.isArray(b.items) || !b.items.length || b.items.length > 30) return res.status(400).json({ error: 'Cart is empty' });
+  const items = [];
+  for (const i of b.items) {
+    const p = products[i.productId], q = Number(i.quantity);
+    if (!p || !Number.isInteger(q) || q < 1 || q > 10) return res.status(400).json({ error: 'Invalid item in cart' });
+    items.push({ productId: p.id, name: p.name, price: p.price, quantity: q, size: txt(i.size, 20), color: txt(i.color, 20) });
   }
-  const data=readData();
-  const order={id:'DUC'+Date.now().toString().slice(-8),createdAt:new Date().toISOString(),customer:{name:String(c.name).slice(0,100),phone:String(c.phone),address:String(c.address).slice(0,300),city:String(c.city).slice(0,100),pin:String(c.pin)},paymentMethod:body.paymentMethod,total,items:cleanItems,status:'Pending'};
-  data.orders.unshift(order);writeData(data);
-  res.status(201).json({order:{id:order.id,status:order.status}});
+  const sub = items.reduce((s, i) => s + i.price * i.quantity, 0);
+  const coupon = txt(b.coupon, 20).toUpperCase() === 'WELCOME10' ? 'WELCOME10' : '';
+  const discount = coupon ? Math.round(sub * 0.1) : 0, shipping = sub - discount >= FREE_ABOVE ? 0 : SHIP_FEE;
+  const order = { id: 'DUC' + crypto.randomInt(1000000, 9999999), createdAt: new Date().toISOString(), customer, items, subtotal: sub, discount, coupon, shipping, total: sub - discount + shipping, paymentMethod: 'COD', status: 'Pending' };
+  db.orders.push(order); save();
+  res.json({ order: { id: order.id, total: order.total } });
 });
 
-// Razorpay Checkout integration. Configure RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET
-// in the hosting provider's server-side environment variables. Never expose the secret to the browser.
-app.post('/api/payments/razorpay/order', async (req,res)=>{
-  const keyId=process.env.RAZORPAY_KEY_ID, keySecret=process.env.RAZORPAY_KEY_SECRET;
-  if(!keyId||!keySecret)return res.status(503).json({error:'Online payments are not configured yet. Store owner must add Razorpay keys on the server.'});
-  const amount=Number(req.body.amount);
-  if(!Number.isInteger(amount)||amount<1||amount>50000000)return res.status(400).json({error:'Invalid payment amount'});
-  try{
-    const auth=Buffer.from(keyId+':'+keySecret).toString('base64');
-    const response=await fetch('https://api.razorpay.com/v1/orders',{method:'POST',headers:{'Authorization':'Basic '+auth,'Content-Type':'application/json'},body:JSON.stringify({amount,currency:'INR',receipt:'duc_'+Date.now().toString().slice(-10),notes:{store:'Duccy'}})});
-    const data=await response.json();
-    if(!response.ok)return res.status(502).json({error:data.error?.description||'Payment provider order creation failed'});
-    res.json({keyId,orderId:data.id,amount:data.amount,currency:data.currency});
-  }catch(e){res.status(502).json({error:'Could not connect to payment provider'});}
+app.post('/api/admin/login', limit('login', 10, 15 * 60e3), (req, res) => {
+  if (!eq(req.body && req.body.password, ADMIN_PASSWORD)) return res.status(401).json({ error: 'Wrong password' });
+  res.json({ token: makeToken() });
 });
-app.post('/api/payments/razorpay/verify',(req,res)=>{
-  const secret=process.env.RAZORPAY_KEY_SECRET;
-  if(!secret)return res.status(503).json({error:'Payments are not configured'});
-  const {razorpay_order_id,razorpay_payment_id,razorpay_signature}=req.body||{};
-  if(!razorpay_order_id||!razorpay_payment_id||!razorpay_signature)return res.status(400).json({error:'Missing payment verification fields'});
-  const expected=crypto.createHmac('sha256',secret).update(razorpay_order_id+'|'+razorpay_payment_id).digest('hex');
-  const a=Buffer.from(String(expected)),b=Buffer.from(String(razorpay_signature));
-  if(a.length!==b.length||!crypto.timingSafeEqual(a,b))return res.status(400).json({error:'Payment signature verification failed'});
-  res.json({verified:true,paymentId:razorpay_payment_id});
+app.get('/api/admin/orders', auth, (req, res) => res.json({ orders: [...db.orders].reverse() }));
+app.patch('/api/admin/orders/:id', auth, (req, res) => {
+  const o = db.orders.find(o => o.id === req.params.id), s = req.body && req.body.status;
+  if (!o) return res.status(404).json({ error: 'Order not found' });
+  if (!STATUSES.includes(s)) return res.status(400).json({ error: 'Invalid status' });
+  o.status = s; save(); res.json({ order: o });
 });
 
-app.get('/api/admin/orders',auth,(req,res)=>res.json({orders:readData().orders}));
-app.patch('/api/admin/orders/:id',auth,(req,res)=>{
-  const allowed=['Pending','Confirmed','Packed','Shipped','Delivered','Cancelled'];const status=String(req.body.status||'');
-  if(!allowed.includes(status))return res.status(400).json({error:'Invalid order status'});
-  const data=readData();const order=data.orders.find(o=>o.id===req.params.id);
-  if(!order)return res.status(404).json({error:'Order not found'});
-  order.status=status;order.updatedAt=new Date().toISOString();writeData(data);res.json({order:{id:order.id,status:order.status}});
-});
-app.get('/api/health',(req,res)=>res.json({ok:true,service:'Duccy Store API'}));
-app.listen(PORT,()=>console.log(`Duccy store running on port ${PORT}`));
+// pages (explicit routes so server files are never exposed)
+const page = f => fs.readFileSync(path.join(__dirname, f), 'utf8');
+app.get(['/', '/index.html'], (req, res) => res.type('html').send(page('index.html').replaceAll('__SITE_URL__', SITE_URL)));
+app.get('/admin.html', (req, res) => res.type('html').set('X-Robots-Tag', 'noindex').send(page('admin.html')));
+app.get('/robots.txt', (req, res) => res.type('text').send('User-agent: *\nAllow: /\nDisallow: /admin.html\nDisallow: /api/\n' + (SITE_URL ? 'Sitemap: ' + SITE_URL + '/sitemap.xml\n' : '')));
+app.get('/sitemap.xml', (req, res) => res.type('xml').send('<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>' + SITE_URL + '/</loc></url></urlset>'));
+app.use((req, res) => res.status(404).type('html').send('<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Page not found — Duccy</title><body style="font-family:Arial;text-align:center;padding:60px 20px"><h1 style="color:#ff4f8b">404</h1><p>Ye page nahi mila.</p><a href="/" style="color:#ff4f8b">← Duccy home</a></body>'));
+app.listen(process.env.PORT || 3000, () => console.log('Duccy running'));

@@ -1,0 +1,74 @@
+[
+ {
+  "id": 1,
+  "name": "Duccy Crown Oversized T-Shirt",
+  "price": 599,
+  "cat": "Oversized"
+ },
+ {
+  "id": 2,
+  "name": "Minimal Duccy T-Shirt",
+  "price": 549,
+  "cat": "T-Shirts"
+ },
+ {
+  "id": 3,
+  "name": "Duccy Essential Hoodie",
+  "price": 999,
+  "cat": "Hoodies"
+ },
+ {
+  "id": 4,
+  "name": "Duccy Cargo Pants",
+  "price": 899,
+  "cat": "Bottom Wear"
+ },
+ {
+  "id": 5,
+  "name": "Duccy Signature Cap",
+  "price": 399,
+  "cat": "Accessories"
+ },
+ {
+  "id": 6,
+  "name": "Duccy Premium Tote Bag",
+  "price": 349,
+  "cat": "Premium"
+ },
+ {
+  "id": 7,
+  "name": "Duccy Streetwear Tee",
+  "price": 699,
+  "cat": "Premium"
+ },
+ {
+  "id": 8,
+  "name": "Duccy Everyday Shorts",
+  "price": 499,
+  "cat": "Bottom Wear"
+ },
+ {
+  "id": 9,
+  "name": "Duccy Classic Sweatshirt",
+  "price": 899,
+  "cat": "Hoodies"
+ },
+ {
+  "id": 10,
+  "name": "Duccy Oversized Essential",
+  "price": 649,
+  "cat": "Oversized"
+ },
+ {
+  "id": 11,
+  "name": "Duccy Premium Layer",
+  "price": 1199,
+  "cat": "Premium"
+ },
+ {
+  "id": 12,
+  "name": "Duccy Daily Cap",
+  "price": 399,
+  "cat": "Accessories"
+ }
+]
